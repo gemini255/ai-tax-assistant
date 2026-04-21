@@ -1,28 +1,30 @@
+import os
+import re
+from dotenv import load_dotenv
+
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from sentence_transformers import CrossEncoder
 from google import genai
-import re
 
 # -----------------------------
-# Configure Gemini API
+# Load ENV
 # -----------------------------
-client = genai.Client(api_key="AIzaSyCTB3Vm6kMNsm7oVn4O5wtA7nn_9cFFds8")
+load_dotenv()
+
+client = genai.Client(api_key=os.getenv("API_KEY"))
 
 # -----------------------------
-# Load embedding model
+# Models
 # -----------------------------
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-mpnet-base-v2"
 )
 
-# -----------------------------
-# Load reranker model
-# -----------------------------
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # -----------------------------
-# Load vector database
+# Vector DB
 # -----------------------------
 db = FAISS.load_local(
     "backend/vector_db",
@@ -31,59 +33,59 @@ db = FAISS.load_local(
 )
 
 # -----------------------------
-# Conversation memory
+# Memory
 # -----------------------------
 chat_history = []
 
 # -----------------------------
-# Tax domain guard
+# Domain Guard
 # -----------------------------
 tax_keywords = [
-    "tax","income tax","itr","return","filing",
-    "verification","e-verification","everification",
-    "refund","tds","pan","aadhaar","assessment",
-    "section","income tax act","income tax bill",
-    "deduction","80c","80d","hra",
-    "new regime","old regime","tax regime",
-    "budget","budget 2025","budget 2026",
-    "circular","cbdt",
-    "scheme","filing of return",
-    "salary","income","capital gains"
+    "tax", "income tax", "itr", "return", "filing",
+    "refund", "tds", "pan", "aadhaar",
+    "deduction", "80c", "80d", "hra",
+    "new regime", "old regime", "tax regime",
+    "section", "salary", "income",
+    "capital gains", "gst", "rebate"
 ]
 
-
-def is_tax_question(question):
+def is_tax_question(question: str):
     q = question.lower()
     return any(word in q for word in tax_keywords)
 
-
 # -----------------------------
-# Extract tax section numbers
+# Extract section number
 # -----------------------------
 def extract_section(query):
-    match = re.search(r"\b\d+[a-zA-Z]?\b", query)
-    return match.group(0) if match else None
-
+    # catches 80c, 80 c, section 80c, 194j etc.
+    match = re.search(r'(\d+\s*[a-zA-Z]?)', query.lower())
+    if match:
+        return match.group(1).replace(" ", "")
+    return None
 
 # -----------------------------
-# Rerank retrieved documents
+# Rerank
 # -----------------------------
-def rerank_docs(question, docs, top_k=8):
-
+def rerank_docs(question, docs, top_k=4):
     if not docs:
         return []
 
-    pairs = [(question, d.page_content) for d in docs]
+    pairs = [(question, d.page_content[:1200]) for d in docs]
     scores = reranker.predict(pairs)
 
-    scored_docs = list(zip(docs, scores))
-    scored_docs = sorted(scored_docs, key=lambda x: x[1], reverse=True)
-
-    return [doc for doc, score in scored_docs[:top_k]]
-
+    ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+    return [doc for doc, _ in ranked[:top_k]]
 
 # -----------------------------
-# Main chatbot function
+# Clean output
+# -----------------------------
+def clean_text(text):
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+# -----------------------------
+# Main chatbot
 # -----------------------------
 def ask_tax_bot(question):
 
@@ -92,45 +94,53 @@ def ask_tax_bot(question):
 
     section = extract_section(question)
 
-    # Retrieve documents
-    docs = db.similarity_search(question, k=15)
+    # Better retrieval
+    docs = db.similarity_search(question, k=25)
 
-    # Section filtering
+    # Flexible section filter
     if section:
-        filtered_docs = [
-            d for d in docs if section.lower() in d.page_content.lower()
-        ]
-        if filtered_docs:
-            docs = filtered_docs
+        filtered = []
+        for d in docs:
+            txt = d.page_content.lower()
+            txt = txt.replace(" ", "").replace("\n", "")
+            if section in txt:
+                filtered.append(d)
 
-    # Rerank documents
-    docs = rerank_docs(question, docs, top_k=8)
+        if filtered:
+            docs = filtered
+
+    # Rerank top docs
+    docs = rerank_docs(question, docs, top_k=4)
 
     # Build context
-    context = "\n\n".join([d.page_content for d in docs])
+    context = "\n\n".join([d.page_content[:1500] for d in docs])
 
+    # If no context, fallback from top docs directly
     if not context.strip():
-        return "I cannot find this information in the tax documents."
+        if docs:
+            return clean_text(docs[0].page_content[:600])
+        return "I could not retrieve relevant tax information right now."
 
-    # Conversation history
-    history_text = ""
+    # History
+    history = ""
     for q, a in chat_history[-3:]:
-        history_text += f"User: {q}\nAssistant: {a}\n"
+        history += f"User: {q}\nAssistant: {a}\n"
 
-    # Prompt
     prompt = f"""
 You are an expert assistant on Indian Income Tax.
 
-Use ONLY the information from the provided context.
+Use ONLY the provided context.
+Be clear, concise, and helpful.
 
 Rules:
-1. If the question is YES/NO, answer Yes or No first.
-2. Do NOT invent information.
-3. If the answer is not in the context, say:
-"I cannot find this information in the tax documents."
+1. If yes/no question, answer Yes or No first.
+2. If section asked, explain it clearly.
+3. Use bullet points when useful.
+4. Do not invent laws not in context.
+5. If exact answer missing, give best available answer from context.
 
-Conversation History:
-{history_text}
+Conversation:
+{history}
 
 Context:
 {context}
@@ -142,24 +152,21 @@ Answer:
 """
 
     try:
-
         response = client.models.generate_content(
             model="gemini-3-flash-preview",
             contents=prompt
         )
 
-        answer = response.text
+        answer = response.text if response.text else ""
 
-        if not answer:
-            answer = "I couldn't generate a response."
+        if not answer.strip():
+            answer = docs[0].page_content[:600]
 
-    except Exception as e:
-        print(f"Gemini API error: {e}")
-        answer = "The tax assistant service is currently unavailable."
+    except Exception:
+        # Fallback if API fails
+        answer = docs[0].page_content[:600]
 
-    # Clean formatting
-    answer = answer.replace("\n", " ")
-    answer = " ".join(answer.split())
+    answer = clean_text(answer)
 
     chat_history.append((question, answer))
 
